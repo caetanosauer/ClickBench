@@ -1,0 +1,47 @@
+#!/bin/bash
+# Reads a SQL query from stdin, runs it once against the PERSISTENT external
+# table in hits_parquet.hyper on the long-lived Hyper server started by ./start
+# (descriptor in server.endpoint).
+# Stdout: query result.
+# Stderr: query runtime in fractional seconds on the last line.
+#
+# The benchmark driver calls this once per try (BENCH_TRIES). Each call opens a
+# fresh connection to the SAME long-lived server. The table is persistent (no
+# per-query CREATE) and ./start holds it attached via a keep-alive, so its
+# compiled query plans survive in the server plan cache across these per-try
+# connections: try 1 (right after the cold cycle) is a plan-cache miss, tries
+# 2..N are plan-cache HITs (compile collapses ~0.2s -> ~0.001s). Parquet data
+# stays in the OS page cache between tries. See issue #936.
+set -e
+
+# shellcheck disable=SC1091
+source myenv/bin/activate
+
+# Stage stdin into a temp file: `python3 - <<'PY'` already consumes stdin to
+# read the program, so sys.stdin.read() inside the heredoc returns "".
+query_file=$(mktemp)
+trap 'rm -f "$query_file"' EXIT
+cat > "$query_file"
+
+python3 - "$query_file" <<'PY'
+import sys
+import timeit
+from tableauhyperapi import Connection, Endpoint
+
+with open(sys.argv[1]) as f:
+    query = f.read()
+
+with open("server.endpoint") as f:
+    descriptor = f.read().strip()
+
+endpoint = Endpoint(connection_descriptor=descriptor, user_agent="clickbench")
+with Connection(endpoint, "hits_parquet.hyper") as connection:
+    start = timeit.default_timer()
+    rows = connection.execute_list_query(query)
+    end = timeit.default_timer()
+
+for r in rows:
+    print(r)
+
+print(f"{end - start:.3f}", file=sys.stderr)
+PY
