@@ -28,3 +28,4 @@ hits.vortex
 
 # Python venvs created by install scripts
 myenv/
+hits_parquet.hyper

@@ -1,4 +1,4 @@
-create temp external table hits
+create external table hits
 for array[
     'hits_0.parquet',
     'hits_10.parquet',
@@ -101,4 +101,4 @@ for array[
     'hits_99.parquet',
     'hits_9.parquet'
 ]
-with (format => 'parquet', binary_as_text => true);
+with (format => 'parquet', binary_as_text => true, immutable => true);

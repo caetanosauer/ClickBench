@@ -5,16 +5,23 @@
 #
 # This is the fix for issue #936: the per-query benchmark driver calls
 # ./query once per try (BENCH_TRIES), keeping a daemon-backed server warm so
-# tries 2..N are genuinely hot. The previous Hyper ./query opened a brand-new
-# HyperProcess on every call, so each "hot" try paid the full cold cost (fresh
-# server, re-parsed parquet metadata, cold OS page cache). With a persistent
-# server those caches stay warm across tries, and the driver's cold cycle
-# (stop -> drop_caches -> start) still gives an honest cold try 1.
+# tries 2..N are genuinely hot. With a persistent server the parquet metadata,
+# OS page cache, AND compiled query plans stay warm across tries, and the
+# driver cold cycle (stop -> drop_caches -> start) still gives an honest cold
+# try 1.
 #
-# Unlike hyper/, there is no hits.hyper to keep attached: the data is external
-# parquet read through the OS page cache (which the driver preserves between
-# tries), and the temp external table is connection-scoped so each ./query
-# recreates it untimed.
+# Unlike the earlier temp-external-table approach, the data is exposed through
+# a PERSISTENT external table in hits_parquet.hyper (created by ./load). The
+# supervisor holds a keep-alive connection that keeps that catalog attached for
+# the server lifetime. This mirrors hyper/ (native): without the keep-alive the
+# catalog would be destroyed the moment a per-try ./query process exits, which
+# triggers PlanCache::evictCacheEntries() and drops the table's compiled plans,
+# forcing a ~0.2s recompile on every try (plan-cache miss). With it, tries 2..N
+# get plan-cache HITs (compile ~0.001s), matching native behaviour.
+#
+# experimental_persisted_external_tables=on is required to create/open a
+# persistent external table (otherwise "Persisted external tables are
+# disabled"). This is an experimental Hyper feature; see report methodology.
 set -e
 
 # shellcheck disable=SC1091
@@ -28,42 +35,53 @@ fi
 # Clean up stale artifacts from a previous (possibly crashed) server.
 rm -f server.pid server.endpoint
 
-# Background a supervisor that opens HyperProcess, writes the descriptor, then
-# blocks until ./stop signals it. nohup so it survives this script exiting;
-# $! is the supervisor PID we kill in ./stop.
+# Background a supervisor that opens HyperProcess, writes the descriptor,
+# attaches hits_parquet.hyper (if present) to keep its catalog + plans warm,
+# then blocks until ./stop signals it.
 nohup python3 - >server.log 2>&1 <<'PY' &
 import os
 import signal
 import sys
-from tableauhyperapi import HyperProcess, Telemetry
+from tableauhyperapi import HyperProcess, Telemetry, Connection, CreateMode
 
 
 def _terminate(*_):
-    # Raise SystemExit so the `with HyperProcess` block exits cleanly and
-    # hyperd is shut down with us (it is terminated when its controlling
-    # process exits).
     sys.exit(0)
 
 
 signal.signal(signal.SIGTERM, _terminate)
 signal.signal(signal.SIGINT, _terminate)
 
-with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
-    # Publish the descriptor atomically so ./check and ./query never read a
-    # half-written file.
+# experimental_persisted_external_tables must be enabled at startup so the
+# persistent external table in hits_parquet.hyper can be created/opened.
+with HyperProcess(
+    telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU,
+    parameters={"experimental_persisted_external_tables": "on"},
+) as hyper:
+    # Keep-alive: hold hits_parquet.hyper attached for the server lifetime so
+    # its external-table catalog (and the plan-cache entries depending on it)
+    # are not torn down between per-try ./query processes. Skipped on the
+    # pre-load ./start (file not yet created); established by the next
+    # cold-cycle ./start once ./load has created it. Done BEFORE publishing the
+    # endpoint so ./check never sees a "ready" server still mid-attach.
+    keepalive = None
+    if os.path.exists("hits_parquet.hyper"):
+        keepalive = Connection(hyper.endpoint, "hits_parquet.hyper", CreateMode.NONE)
+
     with open("server.endpoint.tmp", "w") as f:
         f.write(hyper.endpoint.connection_descriptor)
     os.replace("server.endpoint.tmp", "server.endpoint")
-    # Block until a signal arrives; loop so a stray signal can't tear the
-    # server down (only the handler's sys.exit does).
-    while True:
-        signal.pause()
+
+    try:
+        while True:
+            signal.pause()
+    finally:
+        if keepalive is not None:
+            keepalive.close()
 PY
 echo $! > server.pid
 
-# Give the supervisor a moment to publish the endpoint. The benchmark driver
-# also runs ./check in a loop afterwards, so this is just a fast-path / clean
-# error rather than the authoritative readiness gate.
+# Give the supervisor a moment to publish the endpoint.
 for _ in $(seq 1 60); do
     if [ -s server.endpoint ]; then
         exit 0
