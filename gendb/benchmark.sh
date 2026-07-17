@@ -1,5 +1,4 @@
 #!/bin/bash
-# Thin shim — actual flow is in lib/benchmark-common.sh.
 #
 # GenDB's pipeline produces one specialized C++ binary per query (the .cpp
 # files we ship in generated/ were synthesized by a multi-agent LLM pipeline
@@ -11,7 +10,6 @@
 # to start/stop); the data on disk in db/ is persistent across cold cycles.
 export BENCH_DOWNLOAD_SCRIPT="download-hits-parquet-single"
 export BENCH_RESTARTABLE=no
-export BENCH_DURABLE=yes
 # Single-process engine: each query forks a fresh full-machine process with no
 # shared scheduler across connections, so the concurrent-QPS test only
 # oversubscribes RAM rather than measuring throughput. Skip it by default;
